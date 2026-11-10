@@ -13,9 +13,7 @@ window.b4a = b4a
 
 const params = new URLSearchParams(window.location.search)
 const defaultBootstrap = params.get('bootstrap') || '127.0.0.1:49737'
-const defaultTopicHex =
-  params.get('topic') ||
-  'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90'
+const defaultTopicHex = params.get('topic') || 'pear-room-1'
 const defaultNick = params.get('nick') || `Peer-${Math.floor(100 + Math.random() * 900)}`
 
 const state = {
@@ -25,8 +23,10 @@ const state = {
   udx: null,
   dht: null,
   swarm: null,
+  discovery: null,
+  manualPc: null,
   publicKeyHex: '',
-  peers: new Map(), // pubKeyHex -> { conn, mux, channel, nick }
+  peers: new Map(),
   messages: [],
   status: 'idle'
 }
@@ -66,10 +66,11 @@ function appendMessage (msg) {
 }
 
 function parseBootstrapList (str) {
+  if (!str || str === 'serverless' || str === 'none') return []
   return str
     .split(',')
     .map((s) => s.trim())
-    .filter(Boolean)
+    .filter((s) => s.includes(':'))
     .map((pair) => {
       const [host, portStr] = pair.split(':')
       return { host: host || '127.0.0.1', port: Number(portStr) || 49737 }
@@ -77,7 +78,7 @@ function parseBootstrapList (str) {
 }
 
 async function startPearChat (opts = {}) {
-  if (opts.bootstrap) state.bootstrapStr = opts.bootstrap
+  if (opts.bootstrap !== undefined) state.bootstrapStr = opts.bootstrap
   if (opts.topic) state.topicHex = opts.topic
   if (opts.nick) state.nick = opts.nick
 
@@ -85,7 +86,7 @@ async function startPearChat (opts = {}) {
   const bootInput = document.getElementById('bootstrap-input')
   const topicInput = document.getElementById('topic-input')
   if (nickInput && !opts.nick) state.nick = nickInput.value.trim() || state.nick
-  if (bootInput && !opts.bootstrap) state.bootstrapStr = bootInput.value.trim() || state.bootstrapStr
+  if (bootInput && opts.bootstrap === undefined) state.bootstrapStr = bootInput.value.trim()
   if (topicInput && !opts.topic) state.topicHex = topicInput.value.trim() || state.topicHex
 
   if (state.swarm) {
@@ -105,21 +106,28 @@ async function startPearChat (opts = {}) {
   state.status = 'bootstrapping-dht'
   updateStatsUI()
 
-  const bootstrap = parseBootstrapList(state.bootstrapStr)
+  const externalBootstrap = parseBootstrapList(state.bootstrapStr)
   const udx = new BrowserUDX()
   state.udx = udx
   udx.on('direct-p2p-open', () => updateStatsUI())
 
+  const isLocalMesh = externalBootstrap.length === 0
+
   const dht = new HyperDHT({
     udx,
-    bootstrap,
-    ephemeral: true,
-    firewalled: true,
-    host: '127.0.0.1'
+    bootstrap: externalBootstrap,
+    ephemeral: !isLocalMesh,
+    firewalled: !isLocalMesh,
+    host: isLocalMesh ? udx.localIp : '127.0.0.1'
   })
   state.dht = dht
 
   await dht.fullyBootstrapped()
+  await dht.bind()
+  if (isLocalMesh && dht.io.serverSocket) {
+    dht._nat.add(udx.localIp, dht.io.serverSocket.address().port)
+  }
+
   state.publicKeyHex = b4a.toString(dht.defaultKeyPair.publicKey, 'hex')
   state.status = 'joining-swarm'
   updateStatsUI()
@@ -184,15 +192,155 @@ async function startPearChat (opts = {}) {
     })
   })
 
+  await swarm.listen()
   const topicBuf = HyperDHT.hash(b4a.from(state.topicHex, 'utf8'))
   const discovery = swarm.join(topicBuf, { client: true, server: true })
-  await discovery.flushed()
+  state.discovery = discovery
+  if (!isLocalMesh) {
+    await discovery.flushed()
+  }
   if (state.peers.size === 0) state.status = 'swarm-flushed-waiting-peers'
   updateStatsUI()
 
   return {
     publicKeyHex: state.publicKeyHex,
     topicHex: b4a.toString(topicBuf, 'hex')
+  }
+}
+
+function waitForIceGathering (pc, timeoutMs = 2500) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve()
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs)
+    const check = () => {
+      if (pc.iceGatheringState === 'complete') {
+        clearTimeout(timer)
+        resolve()
+      }
+    }
+    pc.addEventListener('icegatheringstatechange', check)
+  })
+}
+
+async function createZeroServerInvite () {
+  if (!state.udx) {
+    await startPearChat({ bootstrap: 'serverless' })
+  }
+  const pc = new RTCPeerConnection({ iceServers: state.udx.iceServers })
+  state.manualPc = pc
+
+  const dc = pc.createDataChannel('udx-invite', {
+    ordered: false,
+    maxRetransmits: 0
+  })
+
+  pc.onconnectionstatechange = () => updateStatsUI()
+  dc.onopen = async () => {
+    if (!state._remotePeer) return
+    const { ip, port, pub } = state._remotePeer
+    state.udx.attachPeerChannel(ip, dc)
+    state.dht.addNode({ host: ip, port })
+    const conn = state.dht.connect(b4a.from(pub, 'hex'), {
+      relayAddresses: [{ host: ip, port }]
+    })
+    conn.once('open', () => {
+      state.swarm.emit('connection', conn)
+    })
+    updateStatsUI()
+  }
+
+  const offer = await pc.createOffer()
+  await pc.setLocalDescription(offer)
+  await waitForIceGathering(pc)
+
+  const myPort = state.dht.io.serverSocket.address().port
+  const token = b4a.toString(
+    b4a.from(
+      JSON.stringify({
+        t: 'o',
+        ip: state.udx.localIp,
+        port: myPort,
+        pub: state.publicKeyHex,
+        topic: state.topicHex,
+        sdp: pc.localDescription
+      }),
+      'utf8'
+    ),
+    'base64'
+  )
+
+  const outEl = document.getElementById('invite-box')
+  if (outEl) outEl.value = token
+  state.status = 'invite-created-awaiting-answer'
+  updateStatsUI()
+  return token
+}
+
+async function acceptZeroServerToken (rawToken) {
+  if (!rawToken || !rawToken.trim()) return
+  const clean = rawToken.trim()
+  const decoded = JSON.parse(b4a.toString(b4a.from(clean, 'base64'), 'utf8'))
+
+  if (decoded.t === 'o') {
+    if (!state.udx || state.topicHex !== decoded.topic) {
+      await startPearChat({ bootstrap: 'serverless', topic: decoded.topic })
+    }
+    state._remotePeer = {
+      ip: decoded.ip,
+      port: decoded.port,
+      pub: decoded.pub
+    }
+
+    const pc = new RTCPeerConnection({ iceServers: state.udx.iceServers })
+    state.manualPc = pc
+
+    pc.ondatachannel = (ev) => {
+      const dc = ev.channel
+      dc.onopen = () => {
+        const { ip, port } = state._remotePeer
+        state.udx.attachPeerChannel(ip, dc)
+        state.dht.addNode({ host: ip, port })
+        updateStatsUI()
+      }
+    }
+
+    await pc.setRemoteDescription(decoded.sdp)
+    const answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    await waitForIceGathering(pc)
+
+    const myPort = state.dht.io.serverSocket.address().port
+    const answerToken = b4a.toString(
+      b4a.from(
+        JSON.stringify({
+          t: 'a',
+          ip: state.udx.localIp,
+          port: myPort,
+          pub: state.publicKeyHex,
+          sdp: pc.localDescription
+        }),
+        'utf8'
+      ),
+      'base64'
+    )
+
+    const outEl = document.getElementById('invite-box')
+    if (outEl) outEl.value = answerToken
+    state.status = 'answer-ready-copy-back'
+    updateStatsUI()
+    return answerToken
+  }
+
+  if (decoded.t === 'a' && state.manualPc) {
+    state._remotePeer = {
+      ip: decoded.ip,
+      port: decoded.port,
+      pub: decoded.pub
+    }
+    await state.manualPc.setRemoteDescription(decoded.sdp)
+    state.status = 'punching-direct-udp'
+    updateStatsUI()
+    return true
   }
 }
 
@@ -225,6 +373,8 @@ function sendChatMessage (text) {
 
 window.startPearChat = startPearChat
 window.sendChatMessage = sendChatMessage
+window.createZeroServerInvite = createZeroServerInvite
+window.acceptZeroServerToken = acceptZeroServerToken
 
 window.addEventListener('DOMContentLoaded', () => {
   const nickInput = document.getElementById('nick-input')
@@ -233,6 +383,10 @@ window.addEventListener('DOMContentLoaded', () => {
   const joinBtn = document.getElementById('join-btn')
   const sendBtn = document.getElementById('send-btn')
   const msgInput = document.getElementById('msg-input')
+  const createInviteBtn = document.getElementById('create-invite-btn')
+  const copyInviteBtn = document.getElementById('copy-invite-btn')
+  const acceptInviteBtn = document.getElementById('accept-invite-btn')
+  const inviteBox = document.getElementById('invite-box')
 
   if (nickInput) nickInput.value = state.nick
   if (bootInput) bootInput.value = state.bootstrapStr
@@ -241,6 +395,37 @@ window.addEventListener('DOMContentLoaded', () => {
   if (joinBtn) {
     joinBtn.addEventListener('click', () => {
       startPearChat().catch((err) => {
+        state.status = `error: ${err.message}`
+        updateStatsUI()
+      })
+    })
+  }
+
+  if (createInviteBtn) {
+    createInviteBtn.addEventListener('click', () => {
+      createZeroServerInvite().catch((err) => {
+        state.status = `error: ${err.message}`
+        updateStatsUI()
+      })
+    })
+  }
+
+  if (copyInviteBtn && inviteBox) {
+    copyInviteBtn.addEventListener('click', () => {
+      inviteBox.select()
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(inviteBox.value).catch(() => {})
+      } else {
+        document.execCommand('copy')
+      }
+      copyInviteBtn.textContent = 'Copied!'
+      setTimeout(() => { copyInviteBtn.textContent = 'Copy Token' }, 1500)
+    })
+  }
+
+  if (acceptInviteBtn && inviteBox) {
+    acceptInviteBtn.addEventListener('click', () => {
+      acceptZeroServerToken(inviteBox.value).catch((err) => {
         state.status = `error: ${err.message}`
         updateStatsUI()
       })

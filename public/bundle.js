@@ -20912,6 +20912,9 @@ var require_browser_udx = __commonJS(function(exports, module) {
   } = require_cert();
   var DEFAULT_RWND = 262144;
   var MAX_PAYLOAD = 1100;
+  var DEFAULT_ICE_SERVERS = [
+    { urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] }
+  ];
 
   class NodeUdpWebRtcLink {
     constructor(udx, host, port, onOpen, onMessage) {
@@ -21067,7 +21070,7 @@ var require_browser_udx = __commonJS(function(exports, module) {
         return;
       this._directNegotiationStarted = true;
       const PeerConnection = this.udx.RTCPeerConnection;
-      this.directPc = new PeerConnection;
+      this.directPc = new PeerConnection({ iceServers: this.udx.iceServers });
       this.directPc.onicecandidate = (ev) => {
         if (ev.candidate && !this.closed) {
           this._sendSignal({ type: "candidate", candidate: ev.candidate }, sourcePort);
@@ -21099,7 +21102,7 @@ var require_browser_udx = __commonJS(function(exports, module) {
         }
         this._directNegotiationStarted = true;
         if (!this.directPc) {
-          this.directPc = new PeerConnection;
+          this.directPc = new PeerConnection({ iceServers: this.udx.iceServers });
           this.directPc.onicecandidate = (ev) => {
             if (ev.candidate && !this.closed) {
               this._sendSignal({ type: "candidate", candidate: ev.candidate }, localPort);
@@ -21184,32 +21187,7 @@ var require_browser_udx = __commonJS(function(exports, module) {
       if (this.closed || buf.byteLength === 0)
         return;
       if (buf[0] === PEER_ENVELOPE_MAGIC && buf.byteLength >= 10) {
-        const srcPort = buf[1] << 8 | buf[2];
-        const fromHost = `${buf[3]}.${buf[4]}.${buf[5]}.${buf[6]}`;
-        const dstPort = buf[7] << 8 | buf[8];
-        const inner = b4a.from(buf.subarray(9));
-        const peerLink = this.udx._getOrCreateLink(fromHost, srcPort);
-        if (dstPort > 0)
-          peerLink.lastSourcePort = dstPort;
-        if (inner[0] === WEBRTC_SIGNAL_MAGIC) {
-          try {
-            const signal = JSON.parse(b4a.toString(inner.subarray(1)));
-            peerLink._handleSignal(signal, dstPort).catch(() => {});
-          } catch {}
-          return;
-        }
-        if (isUdxPacket(inner)) {
-          this.udx._routeUdxPacket(inner, fromHost, srcPort, dstPort);
-          return;
-        }
-        const sock = this.udx._socketsByPort.get(dstPort);
-        if (sock && !sock._closed) {
-          sock.emit("message", inner, {
-            host: fromHost,
-            port: srcPort,
-            family: 4
-          });
-        }
+        this.udx._handlePeerEnvelope(buf);
         return;
       }
       if (buf[0] === VPORT_MAGIC && buf.byteLength >= 4) {
@@ -21338,7 +21316,7 @@ var require_browser_udx = __commonJS(function(exports, module) {
         throw new Error("Already bound");
       if (this.closing)
         throw new Error("Socket is closed");
-      const assigned = port2 > 0 ? port2 : this.udx._allocPort();
+      const assigned = this.udx._allocPort();
       this._port = assigned;
       this._host = host2 || "0.0.0.0";
       this._family = 4;
@@ -21377,8 +21355,7 @@ var require_browser_udx = __commonJS(function(exports, module) {
       if (!this.bound)
         this.bind(0);
       const targetHost = !host2 || host2 === "0.0.0.0" ? "127.0.0.1" : host2;
-      const link = this.udx._getOrCreateLink(targetHost, port2);
-      link.send(buffer, this._port);
+      this.udx._sendDatagram(this._port, targetHost, port2, buffer);
     }
     async send(buffer, port2, host2) {
       if (this.closing)
@@ -21562,8 +21539,7 @@ var require_browser_udx = __commonJS(function(exports, module) {
         return;
       this._packetsTx++;
       this.udx.udxPacketsTx++;
-      const link = this.udx._getOrCreateLink(this.remoteHost, this.remotePort);
-      link.send(pkt, this.socket._port);
+      this.udx._sendDatagram(this.socket._port, this.remoteHost, this.remotePort, pkt);
     }
     _sendAck() {
       if (!this.connected || this._closed)
@@ -21664,12 +21640,15 @@ var require_browser_udx = __commonJS(function(exports, module) {
       this.fingerprint = opts.fingerprint || DEFAULT_CERT.fingerprint;
       this.iceUfrag = opts.iceUfrag || DEFAULT_ICE_UFRAG;
       this.icePwd = opts.icePwd || DEFAULT_ICE_PWD;
+      this.iceServers = opts.iceServers || DEFAULT_ICE_SERVERS;
       this.RTCPeerConnection = opts.RTCPeerConnection || globalThis.RTCPeerConnection || null;
+      this.localIp = opts.localIp || `11.${1 + (Math.random() * 250 | 0)}.${1 + (Math.random() * 250 | 0)}.${1 + (Math.random() * 250 | 0)}`;
       this._nextPort = 15000 + (Math.random() * 45000 | 0);
       this._socketsByPort = new Map;
       this._streamsById = new Map;
       this._links = new Map;
       this._openNativeLinks = new Set;
+      this._meshChannels = new Map;
       this.udxPacketsTx = 0;
       this.udxPacketsRx = 0;
       this.directP2PConnections = 0;
@@ -21688,6 +21667,97 @@ var require_browser_udx = __commonJS(function(exports, module) {
       if (BrowserUDX.isIPv6(host2))
         return 6;
       return 0;
+    }
+    attachPeerChannel(remoteIp, dc) {
+      if (this._meshChannels.get(remoteIp) === dc)
+        return;
+      this._meshChannels.set(remoteIp, dc);
+      this.directP2PConnections = this._meshChannels.size;
+      dc.binaryType = "arraybuffer";
+      dc.onmessage = (ev) => {
+        const data = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : b4a.from(ev.data);
+        this.directP2PPacketsRx++;
+        this._handlePeerEnvelope(b4a.from(data));
+      };
+      dc.onclose = () => {
+        if (this._meshChannels.get(remoteIp) === dc) {
+          this._meshChannels.delete(remoteIp);
+          this.directP2PConnections = this._meshChannels.size;
+        }
+      };
+      this.emit("direct-p2p-open", { host: remoteIp, port: 49737 });
+    }
+    _sendDatagram(srcPort, dstHost, dstPort, payload) {
+      const buf = b4a.from(payload);
+      if (dstHost === this.localIp && this._socketsByPort.has(dstPort)) {
+        queueMicrotask(() => {
+          if (isUdxPacket(buf)) {
+            this._routeUdxPacket(buf, this.localIp, srcPort, dstPort);
+          } else {
+            const sock = this._socketsByPort.get(dstPort);
+            if (sock && !sock._closed) {
+              sock.emit("message", buf, {
+                host: this.localIp,
+                port: srcPort,
+                family: 4
+              });
+            }
+          }
+        });
+        return;
+      }
+      const meshDc = this._meshChannels.get(dstHost);
+      if (meshDc && meshDc.readyState === "open") {
+        const ipParts = this.localIp.split(".").map(Number);
+        const env = b4a.allocUnsafe(9 + buf.byteLength);
+        env[0] = PEER_ENVELOPE_MAGIC;
+        env[1] = srcPort >>> 8 & 255;
+        env[2] = srcPort & 255;
+        env[3] = (ipParts[0] || 11) & 255;
+        env[4] = (ipParts[1] || 1) & 255;
+        env[5] = (ipParts[2] || 1) & 255;
+        env[6] = (ipParts[3] || 1) & 255;
+        env[7] = dstPort >>> 8 & 255;
+        env[8] = dstPort & 255;
+        b4a.copy(buf, env, 9);
+        this.directP2PPacketsTx++;
+        meshDc.send(env);
+        return;
+      }
+      const link = this._getOrCreateLink(dstHost, dstPort);
+      link.send(buf, srcPort);
+    }
+    _handlePeerEnvelope(buf) {
+      if (buf.byteLength < 10 || buf[0] !== PEER_ENVELOPE_MAGIC)
+        return;
+      const srcPort = buf[1] << 8 | buf[2];
+      const fromHost = `${buf[3]}.${buf[4]}.${buf[5]}.${buf[6]}`;
+      const dstPort = buf[7] << 8 | buf[8];
+      const inner = b4a.from(buf.subarray(9));
+      if (!this._meshChannels.has(fromHost)) {
+        const peerLink = this._getOrCreateLink(fromHost, srcPort);
+        if (dstPort > 0)
+          peerLink.lastSourcePort = dstPort;
+        if (inner[0] === WEBRTC_SIGNAL_MAGIC) {
+          try {
+            const signal = JSON.parse(b4a.toString(inner.subarray(1)));
+            peerLink._handleSignal(signal, dstPort).catch(() => {});
+          } catch {}
+          return;
+        }
+      }
+      if (isUdxPacket(inner)) {
+        this._routeUdxPacket(inner, fromHost, srcPort, dstPort);
+        return;
+      }
+      const sock = this._socketsByPort.get(dstPort);
+      if (sock && !sock._closed) {
+        sock.emit("message", inner, {
+          host: fromHost,
+          port: srcPort,
+          family: 4
+        });
+      }
     }
     _allocPort() {
       while (this._socketsByPort.has(this._nextPort) || this._nextPort >= 65000) {
@@ -21755,7 +21825,13 @@ var require_browser_udx = __commonJS(function(exports, module) {
       for (const link of this._links.values()) {
         closing.push(link.close());
       }
+      for (const dc of this._meshChannels.values()) {
+        try {
+          dc.close();
+        } catch {}
+      }
       this._links.clear();
+      this._meshChannels.clear();
       this._openNativeLinks.clear();
       await Promise.allSettled(closing);
     }
@@ -40230,7 +40306,7 @@ window.BrowserUDX = import_browser_udx.default;
 window.b4a = import_b4a.default;
 var params = new URLSearchParams(window.location.search);
 var defaultBootstrap = params.get("bootstrap") || "127.0.0.1:49737";
-var defaultTopicHex = params.get("topic") || "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+var defaultTopicHex = params.get("topic") || "pear-room-1";
 var defaultNick = params.get("nick") || `Peer-${Math.floor(100 + Math.random() * 900)}`;
 var state = {
   nick: defaultNick,
@@ -40239,6 +40315,8 @@ var state = {
   udx: null,
   dht: null,
   swarm: null,
+  discovery: null,
+  manualPc: null,
   publicKeyHex: "",
   peers: new Map,
   messages: [],
@@ -40279,13 +40357,15 @@ function appendMessage(msg) {
   updateStatsUI();
 }
 function parseBootstrapList(str) {
-  return str.split(",").map((s) => s.trim()).filter(Boolean).map((pair) => {
+  if (!str || str === "serverless" || str === "none")
+    return [];
+  return str.split(",").map((s) => s.trim()).filter((s) => s.includes(":")).map((pair) => {
     const [host2, portStr] = pair.split(":");
     return { host: host2 || "127.0.0.1", port: Number(portStr) || 49737 };
   });
 }
 async function startPearChat(opts = {}) {
-  if (opts.bootstrap)
+  if (opts.bootstrap !== undefined)
     state.bootstrapStr = opts.bootstrap;
   if (opts.topic)
     state.topicHex = opts.topic;
@@ -40296,8 +40376,8 @@ async function startPearChat(opts = {}) {
   const topicInput = document.getElementById("topic-input");
   if (nickInput && !opts.nick)
     state.nick = nickInput.value.trim() || state.nick;
-  if (bootInput && !opts.bootstrap)
-    state.bootstrapStr = bootInput.value.trim() || state.bootstrapStr;
+  if (bootInput && opts.bootstrap === undefined)
+    state.bootstrapStr = bootInput.value.trim();
   if (topicInput && !opts.topic)
     state.topicHex = topicInput.value.trim() || state.topicHex;
   if (state.swarm) {
@@ -40315,19 +40395,24 @@ async function startPearChat(opts = {}) {
   state.peers.clear();
   state.status = "bootstrapping-dht";
   updateStatsUI();
-  const bootstrap = parseBootstrapList(state.bootstrapStr);
+  const externalBootstrap = parseBootstrapList(state.bootstrapStr);
   const udx2 = new import_browser_udx.default;
   state.udx = udx2;
   udx2.on("direct-p2p-open", () => updateStatsUI());
+  const isLocalMesh = externalBootstrap.length === 0;
   const dht = new import_hyperdht.default({
     udx: udx2,
-    bootstrap,
-    ephemeral: true,
-    firewalled: true,
-    host: "127.0.0.1"
+    bootstrap: externalBootstrap,
+    ephemeral: !isLocalMesh,
+    firewalled: !isLocalMesh,
+    host: isLocalMesh ? udx2.localIp : "127.0.0.1"
   });
   state.dht = dht;
   await dht.fullyBootstrapped();
+  await dht.bind();
+  if (isLocalMesh && dht.io.serverSocket) {
+    dht._nat.add(udx2.localIp, dht.io.serverSocket.address().port);
+  }
   state.publicKeyHex = import_b4a.default.toString(dht.defaultKeyPair.publicKey, "hex");
   state.status = "joining-swarm";
   updateStatsUI();
@@ -40386,9 +40471,13 @@ async function startPearChat(opts = {}) {
       updateStatsUI();
     });
   });
+  await swarm.listen();
   const topicBuf = import_hyperdht.default.hash(import_b4a.default.from(state.topicHex, "utf8"));
   const discovery = swarm.join(topicBuf, { client: true, server: true });
-  await discovery.flushed();
+  state.discovery = discovery;
+  if (!isLocalMesh) {
+    await discovery.flushed();
+  }
   if (state.peers.size === 0)
     state.status = "swarm-flushed-waiting-peers";
   updateStatsUI();
@@ -40396,6 +40485,120 @@ async function startPearChat(opts = {}) {
     publicKeyHex: state.publicKeyHex,
     topicHex: import_b4a.default.toString(topicBuf, "hex")
   };
+}
+function waitForIceGathering(pc, timeoutMs = 2500) {
+  if (pc.iceGatheringState === "complete")
+    return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        clearTimeout(timer);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+async function createZeroServerInvite() {
+  if (!state.udx) {
+    await startPearChat({ bootstrap: "serverless" });
+  }
+  const pc = new RTCPeerConnection({ iceServers: state.udx.iceServers });
+  state.manualPc = pc;
+  const dc = pc.createDataChannel("udx-invite", {
+    ordered: false,
+    maxRetransmits: 0
+  });
+  pc.onconnectionstatechange = () => updateStatsUI();
+  dc.onopen = async () => {
+    if (!state._remotePeer)
+      return;
+    const { ip, port: port2, pub } = state._remotePeer;
+    state.udx.attachPeerChannel(ip, dc);
+    state.dht.addNode({ host: ip, port: port2 });
+    const conn = state.dht.connect(import_b4a.default.from(pub, "hex"), {
+      relayAddresses: [{ host: ip, port: port2 }]
+    });
+    conn.once("open", () => {
+      state.swarm.emit("connection", conn);
+    });
+    updateStatsUI();
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForIceGathering(pc);
+  const myPort = state.dht.io.serverSocket.address().port;
+  const token = import_b4a.default.toString(import_b4a.default.from(JSON.stringify({
+    t: "o",
+    ip: state.udx.localIp,
+    port: myPort,
+    pub: state.publicKeyHex,
+    topic: state.topicHex,
+    sdp: pc.localDescription
+  }), "utf8"), "base64");
+  const outEl = document.getElementById("invite-box");
+  if (outEl)
+    outEl.value = token;
+  state.status = "invite-created-awaiting-answer";
+  updateStatsUI();
+  return token;
+}
+async function acceptZeroServerToken(rawToken) {
+  if (!rawToken || !rawToken.trim())
+    return;
+  const clean = rawToken.trim();
+  const decoded = JSON.parse(import_b4a.default.toString(import_b4a.default.from(clean, "base64"), "utf8"));
+  if (decoded.t === "o") {
+    if (!state.udx || state.topicHex !== decoded.topic) {
+      await startPearChat({ bootstrap: "serverless", topic: decoded.topic });
+    }
+    state._remotePeer = {
+      ip: decoded.ip,
+      port: decoded.port,
+      pub: decoded.pub
+    };
+    const pc = new RTCPeerConnection({ iceServers: state.udx.iceServers });
+    state.manualPc = pc;
+    pc.ondatachannel = (ev) => {
+      const dc = ev.channel;
+      dc.onopen = () => {
+        const { ip, port: port2 } = state._remotePeer;
+        state.udx.attachPeerChannel(ip, dc);
+        state.dht.addNode({ host: ip, port: port2 });
+        updateStatsUI();
+      };
+    };
+    await pc.setRemoteDescription(decoded.sdp);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await waitForIceGathering(pc);
+    const myPort = state.dht.io.serverSocket.address().port;
+    const answerToken = import_b4a.default.toString(import_b4a.default.from(JSON.stringify({
+      t: "a",
+      ip: state.udx.localIp,
+      port: myPort,
+      pub: state.publicKeyHex,
+      sdp: pc.localDescription
+    }), "utf8"), "base64");
+    const outEl = document.getElementById("invite-box");
+    if (outEl)
+      outEl.value = answerToken;
+    state.status = "answer-ready-copy-back";
+    updateStatsUI();
+    return answerToken;
+  }
+  if (decoded.t === "a" && state.manualPc) {
+    state._remotePeer = {
+      ip: decoded.ip,
+      port: decoded.port,
+      pub: decoded.pub
+    };
+    await state.manualPc.setRemoteDescription(decoded.sdp);
+    state.status = "punching-direct-udp";
+    updateStatsUI();
+    return true;
+  }
 }
 function sendChatMessage(text) {
   if (!text || !text.trim())
@@ -40423,6 +40626,8 @@ function sendChatMessage(text) {
 }
 window.startPearChat = startPearChat;
 window.sendChatMessage = sendChatMessage;
+window.createZeroServerInvite = createZeroServerInvite;
+window.acceptZeroServerToken = acceptZeroServerToken;
 window.addEventListener("DOMContentLoaded", () => {
   const nickInput = document.getElementById("nick-input");
   const bootInput = document.getElementById("bootstrap-input");
@@ -40430,6 +40635,10 @@ window.addEventListener("DOMContentLoaded", () => {
   const joinBtn = document.getElementById("join-btn");
   const sendBtn = document.getElementById("send-btn");
   const msgInput = document.getElementById("msg-input");
+  const createInviteBtn = document.getElementById("create-invite-btn");
+  const copyInviteBtn = document.getElementById("copy-invite-btn");
+  const acceptInviteBtn = document.getElementById("accept-invite-btn");
+  const inviteBox = document.getElementById("invite-box");
   if (nickInput)
     nickInput.value = state.nick;
   if (bootInput)
@@ -40439,6 +40648,36 @@ window.addEventListener("DOMContentLoaded", () => {
   if (joinBtn) {
     joinBtn.addEventListener("click", () => {
       startPearChat().catch((err) => {
+        state.status = `error: ${err.message}`;
+        updateStatsUI();
+      });
+    });
+  }
+  if (createInviteBtn) {
+    createInviteBtn.addEventListener("click", () => {
+      createZeroServerInvite().catch((err) => {
+        state.status = `error: ${err.message}`;
+        updateStatsUI();
+      });
+    });
+  }
+  if (copyInviteBtn && inviteBox) {
+    copyInviteBtn.addEventListener("click", () => {
+      inviteBox.select();
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(inviteBox.value).catch(() => {});
+      } else {
+        document.execCommand("copy");
+      }
+      copyInviteBtn.textContent = "Copied!";
+      setTimeout(() => {
+        copyInviteBtn.textContent = "Copy Token";
+      }, 1500);
+    });
+  }
+  if (acceptInviteBtn && inviteBox) {
+    acceptInviteBtn.addEventListener("click", () => {
+      acceptZeroServerToken(inviteBox.value).catch((err) => {
         state.status = `error: ${err.message}`;
         updateStatsUI();
       });

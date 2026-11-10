@@ -314,3 +314,118 @@ test('2 BrowserUDX Hyperswarm + Protomux peers discover each other on a topic an
     await dhtNodes[i].destroy()
   }
 })
+
+test('BrowserUDX Hyperswarm peer connects to a 100% stock unmodified native Hyperswarm peer (no WebBridgeUDX on native peer)', async (t) => {
+  const Hyperswarm = require('hyperswarm')
+  const Protomux = require('protomux')
+  const c = require('compact-encoding')
+
+  const dhtNodes = []
+  const bootstrap = []
+
+  for (let i = 0; i < 4; i++) {
+    const node = new HyperDHT({
+      udx: new WebBridgeUDX(),
+      ephemeral: false,
+      firewalled: false,
+      bootstrap,
+      port: 0,
+      host: '127.0.0.1'
+    })
+    await node.fullyBootstrapped()
+    if (bootstrap.length === 0) {
+      bootstrap.push({ host: '127.0.0.1', port: node.address().port })
+    }
+    dhtNodes.push(node)
+  }
+
+  // 100% STOCK unmodified native Hyperswarm peer (uses default udx-native, NO WebBridgeUDX!)
+  const stockNativeDht = new HyperDHT({
+    bootstrap,
+    ephemeral: true,
+    firewalled: true,
+    host: '127.0.0.1'
+  })
+  await stockNativeDht.fullyBootstrapped()
+  const stockNativeSwarm = new Hyperswarm({
+    dht: stockNativeDht,
+    keyPair: stockNativeDht.defaultKeyPair
+  })
+
+  // Browser Hyperswarm peer using BrowserUDX
+  const udxBrowser = new BrowserUDX()
+  const dhtBrowser = new HyperDHT({
+    udx: udxBrowser,
+    bootstrap,
+    ephemeral: true,
+    firewalled: true,
+    host: '127.0.0.1'
+  })
+  await dhtBrowser.fullyBootstrapped()
+  const swarmBrowser = new Hyperswarm({
+    dht: dhtBrowser,
+    keyPair: dhtBrowser.defaultKeyPair
+  })
+
+  const topic = HyperDHT.hash(b4a.from('browser-to-stock-native-hyperswarm-room'))
+
+  const stockNativeReceived = new Promise((resolve) => {
+    stockNativeSwarm.on('connection', (conn) => {
+      conn.on('error', () => {})
+      const mux = Protomux.from(conn)
+      let msgType
+      const ch = mux.createChannel({
+        protocol: 'pear-p2p-chat',
+        id: null
+      })
+      msgType = ch.addMessage({
+        encoding: c.string,
+        onmessage (str) {
+          msgType.send(`stock-native-reply:${str}`)
+          resolve({ str, udxPacketsRx: conn.rawStream.packetsReceived })
+        }
+      })
+      ch.open()
+    })
+  })
+
+  const browserReceived = new Promise((resolve) => {
+    swarmBrowser.on('connection', (conn) => {
+      conn.on('error', () => {})
+      const mux = Protomux.from(conn)
+      let msgType
+      const ch = mux.createChannel({
+        protocol: 'pear-p2p-chat',
+        id: null,
+        onopen () {
+          msgType.send('hello-stock-native-peer')
+        }
+      })
+      msgType = ch.addMessage({
+        encoding: c.string,
+        onmessage (str) {
+          resolve(str)
+        }
+      })
+      ch.open()
+    })
+  })
+
+  const d1 = stockNativeSwarm.join(topic, { client: true, server: true })
+  await d1.flushed()
+  const d2 = swarmBrowser.join(topic, { client: true, server: true })
+  await d2.flushed()
+
+  const [nativeRes, browserRes] = await Promise.all([stockNativeReceived, browserReceived])
+
+  t.is(nativeRes.str, 'hello-stock-native-peer', '100% stock native Hyperswarm peer received message from browser')
+  t.ok(nativeRes.udxPacketsRx > 0, 'stock udx-native C libudx received real 0xff 0x01 UDX packets from browser')
+  t.is(browserRes, 'stock-native-reply:hello-stock-native-peer', 'browser received reply from stock native Hyperswarm peer')
+
+  await swarmBrowser.destroy()
+  await stockNativeSwarm.destroy()
+  await udxBrowser.destroy()
+  for (let i = dhtNodes.length - 1; i >= 0; i--) {
+    await dhtNodes[i].destroy()
+  }
+})
