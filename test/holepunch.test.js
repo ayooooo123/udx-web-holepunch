@@ -324,8 +324,9 @@ test('BrowserUDX Hyperswarm peer connects to a 100% stock unmodified native Hype
   const bootstrap = []
 
   for (let i = 0; i < 4; i++) {
+    // ONLY node 0 is a WebBridgeUDX entry node; nodes 1..3 are 100% stock unmodified HyperDHT nodes!
     const node = new HyperDHT({
-      udx: new WebBridgeUDX(),
+      udx: i === 0 ? new WebBridgeUDX() : undefined,
       ephemeral: false,
       firewalled: false,
       bootstrap,
