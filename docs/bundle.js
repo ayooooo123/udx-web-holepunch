@@ -40737,11 +40737,187 @@ var require_qr = __commonJS(function(exports2, module2) {
     }
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${total} ${total}" shape-rendering="crispEdges"><rect width="${total}" height="${total}" fill="#ffffff"/><path d="${path}" fill="#000000"/></svg>`;
   }
+  function decodeQrRgba(rgba, width, height) {
+    if (!rgba || width < 30 || height < 30)
+      return null;
+    const gray = new Uint8Array(width * height);
+    let minL = 255;
+    let maxL = 0;
+    for (let i = 0, p = 0;i < gray.length; i++, p += 4) {
+      const l = rgba[p] * 77 + rgba[p + 1] * 150 + rgba[p + 2] * 29 >>> 8;
+      gray[i] = l;
+      if (l < minL)
+        minL = l;
+      if (l > maxL)
+        maxL = l;
+    }
+    if (maxL - minL < 30)
+      return null;
+    const thresh = minL + maxL >>> 1;
+    const isDark = (x, y) => gray[(y | 0) * width + (x | 0)] < thresh;
+    let minX = width;
+    let maxX = 0;
+    let minY = height;
+    let maxY = 0;
+    const marginX = width * 0.05 | 0;
+    const marginY = height * 0.05 | 0;
+    for (let y = marginY;y < height - marginY; y++) {
+      for (let x = marginX;x < width - marginX; x++) {
+        if (isDark(x, y)) {
+          if (x < minX)
+            minX = x;
+          if (x > maxX)
+            maxX = x;
+          if (y < minY)
+            minY = y;
+          if (y > maxY)
+            maxY = y;
+        }
+      }
+    }
+    const boxW = maxX - minX + 1;
+    const boxH = maxY - minY + 1;
+    if (boxW < 21 || boxH < 21)
+      return null;
+    for (let version = 1;version <= 14; version++) {
+      const size = 17 + version * 4;
+      const stepX = boxW / size;
+      const stepY = boxH / size;
+      if (stepX < 1 || stepY < 1)
+        continue;
+      const sample = (r, c) => isDark(minX + (c + 0.5) * stepX, minY + (r + 0.5) * stepY) ? 1 : 0;
+      if (!sample(3, 3) || !sample(0, 0) || sample(1, 1) || sample(7, 3) || sample(3, 7)) {
+        continue;
+      }
+      const isFunc = Array.from({ length: size }, () => new Uint8Array(size));
+      const markFunc = (r, c) => {
+        if (r >= 0 && r < size && c >= 0 && c < size)
+          isFunc[r][c] = 1;
+      };
+      const markFinder = (r0, c0) => {
+        for (let dr = -1;dr <= 7; dr++) {
+          for (let dc = -1;dc <= 7; dc++)
+            markFunc(r0 + dr, c0 + dc);
+        }
+      };
+      markFinder(0, 0);
+      markFinder(0, size - 7);
+      markFinder(size - 7, 0);
+      for (let i = 8;i < size - 8; i++) {
+        markFunc(6, i);
+        markFunc(i, 6);
+      }
+      const align = ALIGNMENT_POS[version];
+      for (let i = 0;i < align.length; i++) {
+        for (let j = 0;j < align.length; j++) {
+          if (i === 0 && j === 0 || i === 0 && j === align.length - 1 || i === align.length - 1 && j === 0) {
+            continue;
+          }
+          for (let dr = -2;dr <= 2; dr++) {
+            for (let dc = -2;dc <= 2; dc++)
+              markFunc(align[i] + dr, align[j] + dc);
+          }
+        }
+      }
+      for (let i = 0;i <= 8; i++) {
+        markFunc(8, i);
+        markFunc(i, 8);
+        if (i < 8) {
+          markFunc(8, size - 1 - i);
+          markFunc(size - 1 - i, 8);
+        }
+      }
+      markFunc(size - 8, 8);
+      if (version >= 7) {
+        for (let i = 0;i < 18; i++) {
+          const a = size - 11 + i % 3;
+          const b = Math.floor(i / 3);
+          markFunc(a, b);
+          markFunc(b, a);
+        }
+      }
+      const bits = [];
+      let upward = true;
+      for (let right = size - 1;right >= 1; right -= 2) {
+        if (right === 6)
+          right = 5;
+        for (let vert = 0;vert < size; vert++) {
+          for (let j = 0;j < 2; j++) {
+            const c = right - j;
+            const r = upward ? size - 1 - vert : vert;
+            if (!isFunc[r][c]) {
+              let bit = sample(r, c);
+              if ((r + c) % 2 === 0)
+                bit ^= 1;
+              bits.push(bit);
+            }
+          }
+        }
+        upward = !upward;
+      }
+      const [, totalDataBytes, ecLen, g1Blocks, g1Bytes, g2Blocks, g2Bytes] = VERSION_TABLE_L[version];
+      const totalCodewords = totalDataBytes + ecLen * (g1Blocks + g2Blocks);
+      if (bits.length < totalCodewords * 8)
+        continue;
+      const interleaved = new Uint8Array(totalCodewords);
+      for (let i = 0;i < totalCodewords; i++) {
+        let b = 0;
+        for (let j = 0;j < 8; j++)
+          b = b << 1 | bits[i * 8 + j];
+        interleaved[i] = b;
+      }
+      const dataBlocks = [];
+      for (let i = 0;i < g1Blocks; i++)
+        dataBlocks.push(new Uint8Array(g1Bytes));
+      for (let i = 0;i < g2Blocks; i++)
+        dataBlocks.push(new Uint8Array(g2Bytes));
+      let idx = 0;
+      const maxDataLen = Math.max(g1Bytes, g2Bytes);
+      for (let i = 0;i < maxDataLen; i++) {
+        for (const blk of dataBlocks) {
+          if (i < blk.length)
+            blk[i] = interleaved[idx++];
+        }
+      }
+      const dataBytes = new Uint8Array(totalDataBytes);
+      let dOff = 0;
+      for (const blk of dataBlocks) {
+        dataBytes.set(blk, dOff);
+        dOff += blk.length;
+      }
+      const mode = dataBytes[0] >>> 4;
+      if (mode !== 4)
+        continue;
+      let charCount = 0;
+      let byteStartBit = 0;
+      if (version <= 9) {
+        charCount = (dataBytes[0] & 15) << 4 | dataBytes[1] >>> 4;
+        byteStartBit = 12;
+      } else {
+        charCount = (dataBytes[0] & 15) << 12 | dataBytes[1] << 4 | dataBytes[2] >>> 4;
+        byteStartBit = 20;
+      }
+      if (charCount <= 0 || charCount > totalDataBytes - 2)
+        continue;
+      const outBytes = b4a2.allocUnsafe(charCount);
+      for (let i = 0;i < charCount; i++) {
+        const bitPos = byteStartBit + i * 8;
+        const bIdx = bitPos >>> 3;
+        outBytes[i] = (dataBytes[bIdx] & 15) << 4 | dataBytes[bIdx + 1] >>> 4;
+      }
+      const str = b4a2.toString(outBytes, "utf8");
+      if (str.startsWith("http") || /^[A-Za-z0-9_-]{40,}$/.test(str)) {
+        return str;
+      }
+    }
+    return null;
+  }
   module2.exports = {
     packCompactToken,
     unpackCompactToken,
     encodeQrMatrix,
-    renderQrSvg
+    renderQrSvg,
+    decodeQrRgba
   };
 });
 
@@ -40800,16 +40976,21 @@ function updateStatsUI() {
   }
 }
 function showQrModal(title, subtitle, qrText) {
+  stopQrCameraScan();
   const panel = document.getElementById("qr-panel");
   const titleEl = document.getElementById("qr-title");
   const subEl = document.getElementById("qr-subtitle");
   const boxEl = document.getElementById("qr-svg-box");
+  const videoEl = document.getElementById("qr-video");
   if (!panel || !boxEl)
     return;
   if (titleEl)
     titleEl.textContent = title;
   if (subEl)
     subEl.textContent = subtitle;
+  if (videoEl)
+    videoEl.style.display = "none";
+  boxEl.style.display = "block";
   boxEl.innerHTML = import_qr.renderQrSvg(qrText);
   panel.style.display = "flex";
 }
@@ -41021,7 +41202,7 @@ async function createZeroServerInvite() {
   const outEl = document.getElementById("invite-box");
   if (outEl)
     outEl.value = inviteUrl;
-  showQrModal("1. Scan Invite QR on Phone Camera", "Point your phone camera at this QR code to open the page and generate the Answer QR automatically:", inviteUrl);
+  showQrModal("1. Scan Invite QR on Phone Camera", "Point your phone camera at this QR code (or open the Scan QR camera on the other device):", inviteUrl);
   state.status = "invite-qr-ready-awaiting-answer";
   updateStatsUI();
   return token;
@@ -41066,7 +41247,7 @@ async function acceptZeroServerToken(rawToken) {
     const outEl = document.getElementById("invite-box");
     if (outEl)
       outEl.value = answerToken;
-    showQrModal("2. Answer QR Ready — Scan or Copy Back to Host", 'Scan this QR with the host camera ("Scan QR") or tap "Copy Token" and paste on the host:', answerToken);
+    showQrModal("2. Answer QR Ready — Scan Back on Host", 'Click "Scan QR" on the host device and point it at this Answer QR (or tap Copy Token):', answerToken);
     state.status = "answer-qr-ready-scan-or-copy";
     updateStatsUI();
     return answerToken;
@@ -41083,42 +41264,88 @@ async function acceptZeroServerToken(rawToken) {
     return true;
   }
 }
+function decodeQrFromImageSource(source, w, h, canvas, ctx) {
+  if (!w || !h)
+    return null;
+  canvas.width = w;
+  canvas.height = h;
+  ctx.drawImage(source, 0, 0, w, h);
+  const imgData = ctx.getImageData(0, 0, w, h);
+  return import_qr.decodeQrRgba(imgData.data, imgData.width, imgData.height);
+}
 async function startQrCameraScan() {
+  stopQrCameraScan();
+  const panel = document.getElementById("qr-panel");
+  const titleEl = document.getElementById("qr-title");
+  const subEl = document.getElementById("qr-subtitle");
+  const boxEl = document.getElementById("qr-svg-box");
+  const video = document.getElementById("qr-video");
+  if (!panel || !video)
+    return;
+  if (titleEl)
+    titleEl.textContent = "\uD83D\uDCF7 Point Camera at Peer QR Code";
+  if (subEl)
+    subEl.textContent = "Hold the QR code steady inside the camera frame (or use Snap QR Photo below):";
+  if (boxEl)
+    boxEl.style.display = "none";
+  video.style.display = "block";
+  panel.style.display = "flex";
+  state.status = "opening-camera";
+  updateStatsUI();
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    state.status = "camera-not-available-use-paste";
+    if (subEl)
+      subEl.textContent = 'Live camera blocked by browser—tap "Snap QR Photo" below to scan with your camera app.';
+    state.status = "use-snap-qr-photo";
     updateStatsUI();
     return;
   }
-  const video = document.getElementById("qr-video");
-  if (!video)
-    return;
-  stopQrCameraScan();
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment" }
-  });
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 640 },
+        height: { ideal: 640 }
+      },
+      audio: false
+    });
+  } catch {
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  }
   state.scanStream = stream;
   video.srcObject = stream;
-  video.style.display = "block";
+  video.setAttribute("playsinline", "true");
   await video.play();
-  if (typeof window.BarcodeDetector === "function") {
-    const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
-    state.scanTimer = setInterval(async () => {
-      try {
+  state.status = "scanning-qr-camera";
+  updateStatsUI();
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const detector = typeof window.BarcodeDetector === "function" ? new window.BarcodeDetector({ formats: ["qr_code"] }) : null;
+  state.scanTimer = setInterval(async () => {
+    if (!state.scanStream)
+      return;
+    try {
+      let rawVal = null;
+      const vw = video.videoWidth || 320;
+      const vh = video.videoHeight || 320;
+      if (vw > 0 && vh > 0) {
+        rawVal = decodeQrFromImageSource(video, vw, vh, canvas, ctx);
+      }
+      if (!rawVal && detector) {
         const codes = await detector.detect(video);
         if (codes && codes.length > 0 && codes[0].rawValue) {
-          const val = codes[0].rawValue;
-          stopQrCameraScan();
-          const inviteBox = document.getElementById("invite-box");
-          if (inviteBox)
-            inviteBox.value = val;
-          await acceptZeroServerToken(val);
+          rawVal = codes[0].rawValue;
         }
-      } catch {}
-    }, 250);
-  } else {
-    state.status = "camera-open-paste-token-if-no-barcode-api";
-    updateStatsUI();
-  }
+      }
+      if (rawVal) {
+        stopQrCameraScan();
+        const inviteBox = document.getElementById("invite-box");
+        if (inviteBox)
+          inviteBox.value = rawVal;
+        await acceptZeroServerToken(rawVal);
+      }
+    } catch {}
+  }, 180);
 }
 function stopQrCameraScan() {
   clearInterval(state.scanTimer);
@@ -41132,6 +41359,37 @@ function stopQrCameraScan() {
   if (video) {
     video.srcObject = null;
     video.style.display = "none";
+  }
+}
+async function handleQrFileInput(file) {
+  if (!file)
+    return;
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image;
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+      img.src = url;
+    });
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    const scale = Math.min(1, 1000 / Math.max(img.width, img.height));
+    const w = Math.round(img.width * scale);
+    const h = Math.round(img.height * scale);
+    const rawVal = decodeQrFromImageSource(img, w, h, canvas, ctx);
+    if (rawVal) {
+      stopQrCameraScan();
+      const inviteBox = document.getElementById("invite-box");
+      if (inviteBox)
+        inviteBox.value = rawVal;
+      await acceptZeroServerToken(rawVal);
+    } else {
+      state.status = "no-qr-found-in-photo-try-closer";
+      updateStatsUI();
+    }
+  } finally {
+    URL.revokeObjectURL(url);
   }
 }
 function sendChatMessage(text) {
@@ -41174,6 +41432,7 @@ window.addEventListener("DOMContentLoaded", () => {
   const copyInviteBtn = document.getElementById("copy-invite-btn");
   const acceptInviteBtn = document.getElementById("accept-invite-btn");
   const scanQrBtn = document.getElementById("scan-qr-btn");
+  const snapQrInput = document.getElementById("snap-qr-input");
   const closeQrBtn = document.getElementById("close-qr-btn");
   const inviteBox = document.getElementById("invite-box");
   if (nickInput)
@@ -41223,9 +41482,23 @@ window.addEventListener("DOMContentLoaded", () => {
   if (scanQrBtn) {
     scanQrBtn.addEventListener("click", () => {
       startQrCameraScan().catch((err) => {
+        const subEl = document.getElementById("qr-subtitle");
+        if (subEl)
+          subEl.textContent = `Camera error (${err.message}) — tap "Snap QR Photo" below instead.`;
         state.status = `camera error: ${err.message}`;
         updateStatsUI();
       });
+    });
+  }
+  if (snapQrInput) {
+    snapQrInput.addEventListener("change", (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (file) {
+        handleQrFileInput(file).catch((err) => {
+          state.status = `photo scan error: ${err.message}`;
+          updateStatsUI();
+        });
+      }
     });
   }
   if (closeQrBtn) {

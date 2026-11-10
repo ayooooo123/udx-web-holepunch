@@ -212,8 +212,14 @@
       <div id="qr-title">Scan Invite QR on Phone</div>
       <div id="qr-subtitle"></div>
       <div id="qr-svg-box"></div>
-      <video id="qr-video" playsinline muted></video>
-      <button id="close-qr-btn" class="secondary" type="button">Hide QR</button>
+      <video id="qr-video" autoplay playsinline muted></video>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center">
+        <label style="background:#1e293b;color:var(--cyan);border:1px solid var(--border);border-radius:4px;padding:8px 12px;font-weight:700;font-size:12px;cursor:pointer">
+          📸 Snap QR Photo
+          <input id="snap-qr-input" type="file" accept="image/*" capture="environment" style="display:none" />
+        </label>
+        <button id="close-qr-btn" class="secondary" type="button">Hide QR</button>
+      </div>
     </div>
 
     <div class="stats">

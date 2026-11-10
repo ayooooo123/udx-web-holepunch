@@ -4,7 +4,7 @@ import Protomux from '../node_modules/protomux/index.js'
 import c from 'compact-encoding'
 import b4a from 'b4a'
 import BrowserUDX from '../lib/browser-udx.js'
-import { packCompactToken, unpackCompactToken, renderQrSvg } from '../lib/qr.js'
+import { packCompactToken, unpackCompactToken, renderQrSvg, decodeQrRgba } from '../lib/qr.js'
 
 window.HyperDHT = HyperDHT
 window.Hyperswarm = Hyperswarm
@@ -56,13 +56,17 @@ function updateStatsUI () {
 }
 
 function showQrModal (title, subtitle, qrText) {
+  stopQrCameraScan()
   const panel = document.getElementById('qr-panel')
   const titleEl = document.getElementById('qr-title')
   const subEl = document.getElementById('qr-subtitle')
   const boxEl = document.getElementById('qr-svg-box')
+  const videoEl = document.getElementById('qr-video')
   if (!panel || !boxEl) return
   if (titleEl) titleEl.textContent = title
   if (subEl) subEl.textContent = subtitle
+  if (videoEl) videoEl.style.display = 'none'
+  boxEl.style.display = 'block'
   boxEl.innerHTML = renderQrSvg(qrText)
   panel.style.display = 'flex'
 }
@@ -294,7 +298,7 @@ async function createZeroServerInvite () {
   if (outEl) outEl.value = inviteUrl
   showQrModal(
     '1. Scan Invite QR on Phone Camera',
-    'Point your phone camera at this QR code to open the page and generate the Answer QR automatically:',
+    'Point your phone camera at this QR code (or open the Scan QR camera on the other device):',
     inviteUrl
   )
   state.status = 'invite-qr-ready-awaiting-answer'
@@ -347,8 +351,8 @@ async function acceptZeroServerToken (rawToken) {
     const outEl = document.getElementById('invite-box')
     if (outEl) outEl.value = answerToken
     showQrModal(
-      '2. Answer QR Ready — Scan or Copy Back to Host',
-      'Scan this QR with the host camera ("Scan QR") or tap "Copy Token" and paste on the host:',
+      '2. Answer QR Ready — Scan Back on Host',
+      'Click "Scan QR" on the host device and point it at this Answer QR (or tap Copy Token):',
       answerToken
     )
     state.status = 'answer-qr-ready-scan-or-copy'
@@ -369,42 +373,91 @@ async function acceptZeroServerToken (rawToken) {
   }
 }
 
+function decodeQrFromImageSource (source, w, h, canvas, ctx) {
+  if (!w || !h) return null
+  canvas.width = w
+  canvas.height = h
+  ctx.drawImage(source, 0, 0, w, h)
+  const imgData = ctx.getImageData(0, 0, w, h)
+  return decodeQrRgba(imgData.data, imgData.width, imgData.height)
+}
+
 async function startQrCameraScan () {
+  stopQrCameraScan()
+  const panel = document.getElementById('qr-panel')
+  const titleEl = document.getElementById('qr-title')
+  const subEl = document.getElementById('qr-subtitle')
+  const boxEl = document.getElementById('qr-svg-box')
+  const video = document.getElementById('qr-video')
+  if (!panel || !video) return
+
+  // Make the QR panel visible BEFORE starting camera stream so mobile browsers always show the scanner UI
+  if (titleEl) titleEl.textContent = '📷 Point Camera at Peer QR Code'
+  if (subEl) subEl.textContent = 'Hold the QR code steady inside the camera frame (or use Snap QR Photo below):'
+  if (boxEl) boxEl.style.display = 'none'
+  video.style.display = 'block'
+  panel.style.display = 'flex'
+  state.status = 'opening-camera'
+  updateStatsUI()
+
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    state.status = 'camera-not-available-use-paste'
+    if (subEl) subEl.textContent = 'Live camera blocked by browser—tap "Snap QR Photo" below to scan with your camera app.'
+    state.status = 'use-snap-qr-photo'
     updateStatsUI()
     return
   }
-  const video = document.getElementById('qr-video')
-  if (!video) return
-  stopQrCameraScan()
 
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: 'environment' }
-  })
+  let stream
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 640 },
+        height: { ideal: 640 }
+      },
+      audio: false
+    })
+  } catch {
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+  }
+
   state.scanStream = stream
   video.srcObject = stream
-  video.style.display = 'block'
+  video.setAttribute('playsinline', 'true')
   await video.play()
+  state.status = 'scanning-qr-camera'
+  updateStatsUI()
 
-  if (typeof window.BarcodeDetector === 'function') {
-    const detector = new window.BarcodeDetector({ formats: ['qr_code'] })
-    state.scanTimer = setInterval(async () => {
-      try {
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+  const detector =
+    typeof window.BarcodeDetector === 'function'
+      ? new window.BarcodeDetector({ formats: ['qr_code'] })
+      : null
+
+  state.scanTimer = setInterval(async () => {
+    if (!state.scanStream) return
+    try {
+      let rawVal = null
+      const vw = video.videoWidth || 320
+      const vh = video.videoHeight || 320
+      if (vw > 0 && vh > 0) {
+        rawVal = decodeQrFromImageSource(video, vw, vh, canvas, ctx)
+      }
+      if (!rawVal && detector) {
         const codes = await detector.detect(video)
         if (codes && codes.length > 0 && codes[0].rawValue) {
-          const val = codes[0].rawValue
-          stopQrCameraScan()
-          const inviteBox = document.getElementById('invite-box')
-          if (inviteBox) inviteBox.value = val
-          await acceptZeroServerToken(val)
+          rawVal = codes[0].rawValue
         }
-      } catch {}
-    }, 250)
-  } else {
-    state.status = 'camera-open-paste-token-if-no-barcode-api'
-    updateStatsUI()
-  }
+      }
+      if (rawVal) {
+        stopQrCameraScan()
+        const inviteBox = document.getElementById('invite-box')
+        if (inviteBox) inviteBox.value = rawVal
+        await acceptZeroServerToken(rawVal)
+      }
+    } catch {}
+  }, 180)
 }
 
 function stopQrCameraScan () {
@@ -418,6 +471,36 @@ function stopQrCameraScan () {
   if (video) {
     video.srcObject = null
     video.style.display = 'none'
+  }
+}
+
+async function handleQrFileInput (file) {
+  if (!file) return
+  const url = URL.createObjectURL(file)
+  try {
+    const img = new Image()
+    await new Promise((resolve, reject) => {
+      img.onload = resolve
+      img.onerror = reject
+      img.src = url
+    })
+    const canvas = document.createElement('canvas')
+    const ctx = canvas.getContext('2d')
+    const scale = Math.min(1, 1000 / Math.max(img.width, img.height))
+    const w = Math.round(img.width * scale)
+    const h = Math.round(img.height * scale)
+    const rawVal = decodeQrFromImageSource(img, w, h, canvas, ctx)
+    if (rawVal) {
+      stopQrCameraScan()
+      const inviteBox = document.getElementById('invite-box')
+      if (inviteBox) inviteBox.value = rawVal
+      await acceptZeroServerToken(rawVal)
+    } else {
+      state.status = 'no-qr-found-in-photo-try-closer'
+      updateStatsUI()
+    }
+  } finally {
+    URL.revokeObjectURL(url)
   }
 }
 
@@ -465,6 +548,7 @@ window.addEventListener('DOMContentLoaded', () => {
   const copyInviteBtn = document.getElementById('copy-invite-btn')
   const acceptInviteBtn = document.getElementById('accept-invite-btn')
   const scanQrBtn = document.getElementById('scan-qr-btn')
+  const snapQrInput = document.getElementById('snap-qr-input')
   const closeQrBtn = document.getElementById('close-qr-btn')
   const inviteBox = document.getElementById('invite-box')
 
@@ -515,9 +599,23 @@ window.addEventListener('DOMContentLoaded', () => {
   if (scanQrBtn) {
     scanQrBtn.addEventListener('click', () => {
       startQrCameraScan().catch((err) => {
+        const subEl = document.getElementById('qr-subtitle')
+        if (subEl) subEl.textContent = `Camera error (${err.message}) — tap "Snap QR Photo" below instead.`
         state.status = `camera error: ${err.message}`
         updateStatsUI()
       })
+    })
+  }
+
+  if (snapQrInput) {
+    snapQrInput.addEventListener('change', (ev) => {
+      const file = ev.target.files && ev.target.files[0]
+      if (file) {
+        handleQrFileInput(file).catch((err) => {
+          state.status = `photo scan error: ${err.message}`
+          updateStatsUI()
+        })
+      }
     })
   }
 
@@ -541,7 +639,6 @@ window.addEventListener('DOMContentLoaded', () => {
 
   setInterval(updateStatsUI, 250)
 
-  // If opened by scanning an Invite QR code (?i=<offer>), auto-accept and display the Answer QR immediately!
   if (initialInviteParam) {
     if (inviteBox) inviteBox.value = initialInviteParam
     acceptZeroServerToken(initialInviteParam).catch((err) => {
