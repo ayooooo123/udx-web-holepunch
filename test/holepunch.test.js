@@ -1,0 +1,219 @@
+'use strict'
+
+const test = require('brittle')
+const HyperDHT = require('hyperdht')
+const NoiseSecretStream = require('@hyperswarm/secret-stream')
+const b4a = require('b4a')
+const { WebBridgeUDX, BrowserUDX } = require('../index')
+
+test('direct C libudx <-> BrowserUDXStream (0xff 0x01 wire frames + Noise SecretStream on single UDP port)', async (t) => {
+  const nativeUdx = new WebBridgeUDX()
+  const browserUdx = new BrowserUDX()
+
+  const nativeSocket = nativeUdx.createSocket()
+  nativeSocket.bind(0, '127.0.0.1')
+  const nativePort = nativeSocket.address().port
+
+  const browserSocket = browserUdx.createSocket()
+  browserSocket.bind(0, '127.0.0.1')
+
+  const nativeStreamId = 101
+  const browserStreamId = 202
+
+  const nativeStream = nativeUdx.createStream(nativeStreamId, {
+    framed: true,
+    firewall (sock, port, host) {
+      nativeStream.connect(sock, browserStreamId, port, host)
+      return false
+    }
+  })
+
+  const browserStream = browserUdx.createStream(browserStreamId, {
+    framed: true
+  })
+  browserStream.connect(browserSocket, nativeStreamId, nativePort, '127.0.0.1')
+
+  const serverNoise = new NoiseSecretStream(false, nativeStream)
+  const clientNoise = new NoiseSecretStream(true, browserStream)
+  serverNoise.on('error', () => {})
+  clientNoise.on('error', () => {})
+
+  const receivedByServer = new Promise((resolve) => {
+    serverNoise.once('data', (chunk) => {
+      resolve(b4a.toString(chunk))
+      serverNoise.write(b4a.from('pong-from-native-c-libudx'))
+    })
+  })
+
+  const receivedByBrowser = new Promise((resolve) => {
+    clientNoise.once('data', (chunk) => {
+      resolve(b4a.toString(chunk))
+    })
+  })
+
+  clientNoise.write(b4a.from('ping-from-browser-udx'))
+
+  const msg1 = await receivedByServer
+  const msg2 = await receivedByBrowser
+
+  t.is(msg1, 'ping-from-browser-udx', 'native C libudx parsed 0xff 0x01 UDX + Noise frame from browser')
+  t.is(msg2, 'pong-from-native-c-libudx', 'browser parsed 0xff 0x01 UDX + Noise frame from native C libudx')
+  t.ok(nativeStream.packetsReceived > 0, 'native C libudx recorded real UDX packets received')
+  t.ok(nativeStream.packetsTransmitted > 0, 'native C libudx recorded real UDX packets transmitted')
+
+  clientNoise.destroy()
+  serverNoise.destroy()
+  await browserUdx.destroy()
+  await browserSocket.close()
+  await nativeSocket.close()
+})
+
+test('full HyperDHT cold bootstrap + bidirectional Holepuncher (Browser <-> Firewalled Native Peers)', async (t) => {
+  // Spin up 4 DHT routing nodes with WebBridgeUDX (>=3 required by hyperdht Nat.autoSample for FIREWALL.CONSISTENT)
+  const dhtNodes = []
+  const bootstrap = []
+
+  for (let i = 0; i < 4; i++) {
+    const node = new HyperDHT({
+      udx: new WebBridgeUDX(),
+      ephemeral: false,
+      firewalled: false,
+      bootstrap,
+      port: 0,
+      host: '127.0.0.1'
+    })
+    await node.fullyBootstrapped()
+    if (bootstrap.length === 0) {
+      bootstrap.push({ host: '127.0.0.1', port: node.address().port })
+    }
+    dhtNodes.push(node)
+  }
+
+  // 1. Firewalled native HyperDHT server dialed by firewalled Browser HyperDHT client
+  const nativeServerDht = new HyperDHT({
+    udx: new WebBridgeUDX(),
+    bootstrap,
+    ephemeral: true,
+    firewalled: true,
+    host: '127.0.0.1'
+  })
+  await nativeServerDht.fullyBootstrapped()
+
+  const serverKeyPair = HyperDHT.keyPair()
+  let serverConnResolve
+  const serverConnPromise = new Promise((resolve) => {
+    serverConnResolve = resolve
+  })
+
+  const server = nativeServerDht.createServer({ shareLocalAddress: false }, (conn) => {
+    conn.on('error', () => {})
+    conn.once('data', (data) => {
+      const text = b4a.toString(data)
+      conn.write(b4a.from(`echo:${text}`))
+      serverConnResolve({
+        text,
+        remotePublicKey: conn.remotePublicKey,
+        packetsReceived: conn.rawStream.packetsReceived
+      })
+    })
+  })
+  await server.listen(serverKeyPair)
+
+  const browserUdx = new BrowserUDX()
+  const browserDht = new HyperDHT({
+    udx: browserUdx,
+    bootstrap,
+    ephemeral: true,
+    firewalled: true,
+    host: '127.0.0.1'
+  })
+  await browserDht.fullyBootstrapped()
+
+  const clientConn = browserDht.connect(serverKeyPair.publicKey, {
+    localConnection: false,
+    fastOpen: false
+  })
+  clientConn.on('error', () => {})
+
+  const browserGotEcho = new Promise((resolve, reject) => {
+    clientConn.once('error', reject)
+    clientConn.once('open', () => {
+      clientConn.write(b4a.from('holepunched-udx-payload'))
+    })
+    clientConn.once('data', (data) => {
+      resolve(b4a.toString(data))
+    })
+  })
+
+  const [serverResult, echoReply] = await Promise.all([
+    serverConnPromise,
+    browserGotEcho
+  ])
+
+  t.is(serverResult.text, 'holepunched-udx-payload', 'firewalled native server received payload after holepunch')
+  t.is(echoReply, 'echo:holepunched-udx-payload', 'browser received echoed payload over UDX stream')
+  t.alike(serverResult.remotePublicKey, browserDht.defaultKeyPair.publicKey, 'Noise XX verified browser Ed25519 identity')
+  t.ok(serverResult.packetsReceived > 0, 'native C libudx processed real 0xff 0x01 UDX frames on the holepunched socket')
+  t.ok(
+    nativeServerDht.stats.punches.consistent >= 1 && browserDht.stats.punches.consistent >= 1,
+    `both sides executed consistent UDP NAT holepunch (server=${nativeServerDht.stats.punches.consistent}, browser=${browserDht.stats.punches.consistent})`
+  )
+
+  // 2. Reverse direction: Firewalled Browser HyperDHT server dialed by Firewalled Native HyperDHT client
+  const browserServerKeyPair = HyperDHT.keyPair()
+  let browserServerResolve
+  const browserServerPromise = new Promise((resolve) => {
+    browserServerResolve = resolve
+  })
+
+  const browserServer = browserDht.createServer({ shareLocalAddress: false }, (conn) => {
+    conn.on('error', () => {})
+    conn.once('data', (data) => {
+      const text = b4a.toString(data)
+      conn.write(b4a.from(`browser-server-ack:${text}`))
+      browserServerResolve({
+        text,
+        remotePublicKey: conn.remotePublicKey,
+        packetsReceived: conn.rawStream.packetsReceived
+      })
+    })
+  })
+  await browserServer.listen(browserServerKeyPair)
+
+  const nativeToBrowserConn = nativeServerDht.connect(browserServerKeyPair.publicKey, {
+    localConnection: false,
+    fastOpen: false
+  })
+  nativeToBrowserConn.on('error', () => {})
+
+  const nativeGotAck = new Promise((resolve, reject) => {
+    nativeToBrowserConn.once('error', reject)
+    nativeToBrowserConn.once('open', () => {
+      nativeToBrowserConn.write(b4a.from('native-dialing-browser'))
+    })
+    nativeToBrowserConn.once('data', (data) => {
+      resolve(b4a.toString(data))
+    })
+  })
+
+  const [browserServerRes, nativeAckReply] = await Promise.all([
+    browserServerPromise,
+    nativeGotAck
+  ])
+
+  t.is(browserServerRes.text, 'native-dialing-browser', 'firewalled browser server received payload from native peer after holepunch')
+  t.is(nativeAckReply, 'browser-server-ack:native-dialing-browser', 'native peer received reply from browser server over C libudx')
+  t.alike(browserServerRes.remotePublicKey, nativeServerDht.defaultKeyPair.publicKey, 'browser server verified native Ed25519 identity')
+  t.ok(browserServerRes.packetsReceived > 0, 'BrowserUDXStream processed real 0xff 0x01 UDX frames from C libudx')
+
+  nativeToBrowserConn.destroy()
+  clientConn.destroy()
+  await browserServer.close()
+  await server.close()
+  await browserDht.destroy()
+  await browserUdx.destroy()
+  await nativeServerDht.destroy()
+  for (let i = dhtNodes.length - 1; i >= 0; i--) {
+    await dhtNodes[i].destroy()
+  }
+})
