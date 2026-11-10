@@ -37,7 +37,7 @@ async function main () {
   const server = nativeDht.createServer({ shareLocalAddress: false }, (conn) => {
     conn.on('data', (buf) => {
       console.log('[native-server] rx over C libudx:', b4a.toString(buf), '| udx packets rx:', conn.rawStream.packetsReceived)
-      conn.write(b4a.from('cum-drenched-ack-from-native-udx'))
+      conn.write(b4a.from('ack-from-native-udx'))
     })
   })
   await server.listen(serverKeyPair)

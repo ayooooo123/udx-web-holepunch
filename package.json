@@ -1,11 +1,12 @@
 {
   "name": "udx-web-holepunch",
   "version": "0.1.0",
-  "description": "Zero-external-WebRTC-dep browser-to-native UDX + HyperDHT holepunching over single-port STUN/DTLS/SCTP demux",
+  "description": "Zero-external-WebRTC-dep browser-to-native and browser-to-browser UDX + HyperDHT/Hyperswarm holepunching",
   "main": "index.js",
   "scripts": {
     "test": "brittle test/*.test.js",
-    "demo": "node examples/smoke.js"
+    "demo": "node examples/smoke.js",
+    "chat": "node examples/pear-browser-chat.js"
   },
   "dependencies": {
     "@hyperswarm/secret-stream": "^6.9.1",
@@ -14,6 +15,8 @@
     "dht-rpc": "^6.14.0",
     "hypercore-crypto": "^3.6.0",
     "hyperdht": "^6.25.0",
+    "hyperswarm": "^4.11.0",
+    "protomux": "^3.10.0",
     "sodium-javascript": "~0.8.0",
     "sodium-universal": "^5.0.0",
     "streamx": "^2.21.0",

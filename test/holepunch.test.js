@@ -217,3 +217,100 @@ test('full HyperDHT cold bootstrap + bidirectional Holepuncher (Browser <-> Fire
     await dhtNodes[i].destroy()
   }
 })
+
+test('2 BrowserUDX Hyperswarm + Protomux peers discover each other on a topic and chat P2P', async (t) => {
+  const Hyperswarm = require('hyperswarm')
+  const Protomux = require('protomux')
+  const c = require('compact-encoding')
+
+  const dhtNodes = []
+  const bootstrap = []
+
+  for (let i = 0; i < 4; i++) {
+    const node = new HyperDHT({
+      udx: new WebBridgeUDX(),
+      ephemeral: false,
+      firewalled: false,
+      bootstrap,
+      port: 0,
+      host: '127.0.0.1'
+    })
+    await node.fullyBootstrapped()
+    if (bootstrap.length === 0) {
+      bootstrap.push({ host: '127.0.0.1', port: node.address().port })
+    }
+    dhtNodes.push(node)
+  }
+
+  const udxAlice = new BrowserUDX()
+  const dhtAlice = new HyperDHT({ udx: udxAlice, bootstrap, ephemeral: true, firewalled: true, host: '127.0.0.1' })
+  await dhtAlice.fullyBootstrapped()
+  const swarmAlice = new Hyperswarm({ dht: dhtAlice, keyPair: dhtAlice.defaultKeyPair })
+
+  const udxBob = new BrowserUDX()
+  const dhtBob = new HyperDHT({ udx: udxBob, bootstrap, ephemeral: true, firewalled: true, host: '127.0.0.1' })
+  await dhtBob.fullyBootstrapped()
+  const swarmBob = new Hyperswarm({ dht: dhtBob, keyPair: dhtBob.defaultKeyPair })
+
+  const topic = HyperDHT.hash(b4a.from('pear-browser-to-browser-test-room'))
+
+  const bobReceived = new Promise((resolve) => {
+    swarmBob.on('connection', (conn) => {
+      conn.on('error', () => {})
+      const mux = Protomux.from(conn)
+      let msgType
+      const ch = mux.createChannel({
+        protocol: 'pear-p2p-chat',
+        id: null
+      })
+      msgType = ch.addMessage({
+        encoding: c.string,
+        onmessage (str) {
+          msgType.send(`bob-ack:${str}`)
+          resolve(str)
+        }
+      })
+      ch.open()
+    })
+  })
+
+  const aliceReceived = new Promise((resolve) => {
+    swarmAlice.on('connection', (conn) => {
+      conn.on('error', () => {})
+      const mux = Protomux.from(conn)
+      let msgType
+      const ch = mux.createChannel({
+        protocol: 'pear-p2p-chat',
+        id: null,
+        onopen () {
+          msgType.send('hello-from-alice-swarm')
+        }
+      })
+      msgType = ch.addMessage({
+        encoding: c.string,
+        onmessage (str) {
+          resolve(str)
+        }
+      })
+      ch.open()
+    })
+  })
+
+  const d1 = swarmAlice.join(topic, { client: true, server: true })
+  await d1.flushed()
+  const d2 = swarmBob.join(topic, { client: true, server: true })
+  await d2.flushed()
+
+  const [fromAlice, fromBob] = await Promise.all([bobReceived, aliceReceived])
+
+  t.is(fromAlice, 'hello-from-alice-swarm', 'Bob browser peer received Protomux message over Hyperswarm + UDX')
+  t.is(fromBob, 'bob-ack:hello-from-alice-swarm', 'Alice browser peer received Protomux reply from Bob')
+
+  await swarmAlice.destroy()
+  await swarmBob.destroy()
+  await udxAlice.destroy()
+  await udxBob.destroy()
+  for (let i = dhtNodes.length - 1; i >= 0; i--) {
+    await dhtNodes[i].destroy()
+  }
+})
