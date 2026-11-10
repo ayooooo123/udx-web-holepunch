@@ -4,6 +4,7 @@ import Protomux from '../node_modules/protomux/index.js'
 import c from 'compact-encoding'
 import b4a from 'b4a'
 import BrowserUDX from '../lib/browser-udx.js'
+import { packCompactToken, unpackCompactToken, renderQrSvg } from '../lib/qr.js'
 
 window.HyperDHT = HyperDHT
 window.Hyperswarm = Hyperswarm
@@ -15,6 +16,7 @@ const params = new URLSearchParams(window.location.search)
 const defaultBootstrap = params.get('bootstrap') || '127.0.0.1:49737'
 const defaultTopicHex = params.get('topic') || 'pear-room-1'
 const defaultNick = params.get('nick') || `Peer-${Math.floor(100 + Math.random() * 900)}`
+const initialInviteParam = params.get('i') || params.get('invite') || ''
 
 const state = {
   nick: defaultNick,
@@ -25,6 +27,8 @@ const state = {
   swarm: null,
   discovery: null,
   manualPc: null,
+  scanStream: null,
+  scanTimer: null,
   publicKeyHex: '',
   peers: new Map(),
   messages: [],
@@ -49,6 +53,24 @@ function updateStatsUI () {
   if (p2pStatsEl && state.udx) {
     p2pStatsEl.textContent = `Links: ${state.udx.directP2PConnections} | TX: ${state.udx.directP2PPacketsTx} | RX: ${state.udx.directP2PPacketsRx}`
   }
+}
+
+function showQrModal (title, subtitle, qrText) {
+  const panel = document.getElementById('qr-panel')
+  const titleEl = document.getElementById('qr-title')
+  const subEl = document.getElementById('qr-subtitle')
+  const boxEl = document.getElementById('qr-svg-box')
+  if (!panel || !boxEl) return
+  if (titleEl) titleEl.textContent = title
+  if (subEl) subEl.textContent = subtitle
+  boxEl.innerHTML = renderQrSvg(qrText)
+  panel.style.display = 'flex'
+}
+
+function hideQrModal () {
+  stopQrCameraScan()
+  const panel = document.getElementById('qr-panel')
+  if (panel) panel.style.display = 'none'
 }
 
 function appendMessage (msg) {
@@ -156,6 +178,7 @@ async function startPearChat (opts = {}) {
           nick: remoteKeyHex.slice(0, 8)
         })
         state.status = 'connected-p2p'
+        hideQrModal()
         updateStatsUI()
       },
       onclose () {
@@ -184,6 +207,7 @@ async function startPearChat (opts = {}) {
     channel.open()
     state.peers.set(remoteKeyHex, { conn, mux, channel, chatMessage, nick: remoteKeyHex.slice(0, 8) })
     state.status = 'connected-p2p'
+    hideQrModal()
     updateStatsUI()
 
     conn.once('close', () => {
@@ -208,7 +232,7 @@ async function startPearChat (opts = {}) {
   }
 }
 
-function waitForIceGathering (pc, timeoutMs = 2500) {
+function waitForIceGathering (pc, timeoutMs = 2000) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve()
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, timeoutMs)
@@ -254,32 +278,33 @@ async function createZeroServerInvite () {
   await waitForIceGathering(pc)
 
   const myPort = state.dht.io.serverSocket.address().port
-  const token = b4a.toString(
-    b4a.from(
-      JSON.stringify({
-        t: 'o',
-        ip: state.udx.localIp,
-        port: myPort,
-        pub: state.publicKeyHex,
-        topic: state.topicHex,
-        sdp: pc.localDescription
-      }),
-      'utf8'
-    ),
-    'base64'
-  )
+  const token = packCompactToken({
+    type: 'o',
+    ip: state.udx.localIp,
+    port: myPort,
+    pubHex: state.publicKeyHex,
+    topic: state.topicHex,
+    desc: pc.localDescription
+  })
+
+  const baseUrl = window.location.origin + window.location.pathname
+  const inviteUrl = `${baseUrl}?i=${token}`
 
   const outEl = document.getElementById('invite-box')
-  if (outEl) outEl.value = token
-  state.status = 'invite-created-awaiting-answer'
+  if (outEl) outEl.value = inviteUrl
+  showQrModal(
+    '1. Scan Invite QR on Phone Camera',
+    'Point your phone camera at this QR code to open the page and generate the Answer QR automatically:',
+    inviteUrl
+  )
+  state.status = 'invite-qr-ready-awaiting-answer'
   updateStatsUI()
   return token
 }
 
 async function acceptZeroServerToken (rawToken) {
   if (!rawToken || !rawToken.trim()) return
-  const clean = rawToken.trim()
-  const decoded = JSON.parse(b4a.toString(b4a.from(clean, 'base64'), 'utf8'))
+  const decoded = unpackCompactToken(rawToken)
 
   if (decoded.t === 'o') {
     if (!state.udx || state.topicHex !== decoded.topic) {
@@ -310,23 +335,23 @@ async function acceptZeroServerToken (rawToken) {
     await waitForIceGathering(pc)
 
     const myPort = state.dht.io.serverSocket.address().port
-    const answerToken = b4a.toString(
-      b4a.from(
-        JSON.stringify({
-          t: 'a',
-          ip: state.udx.localIp,
-          port: myPort,
-          pub: state.publicKeyHex,
-          sdp: pc.localDescription
-        }),
-        'utf8'
-      ),
-      'base64'
-    )
+    const answerToken = packCompactToken({
+      type: 'a',
+      ip: state.udx.localIp,
+      port: myPort,
+      pubHex: state.publicKeyHex,
+      topic: '',
+      desc: pc.localDescription
+    })
 
     const outEl = document.getElementById('invite-box')
     if (outEl) outEl.value = answerToken
-    state.status = 'answer-ready-copy-back'
+    showQrModal(
+      '2. Answer QR Ready — Scan or Copy Back to Host',
+      'Scan this QR with the host camera ("Scan QR") or tap "Copy Token" and paste on the host:',
+      answerToken
+    )
+    state.status = 'answer-qr-ready-scan-or-copy'
     updateStatsUI()
     return answerToken
   }
@@ -341,6 +366,58 @@ async function acceptZeroServerToken (rawToken) {
     state.status = 'punching-direct-udp'
     updateStatsUI()
     return true
+  }
+}
+
+async function startQrCameraScan () {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    state.status = 'camera-not-available-use-paste'
+    updateStatsUI()
+    return
+  }
+  const video = document.getElementById('qr-video')
+  if (!video) return
+  stopQrCameraScan()
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'environment' }
+  })
+  state.scanStream = stream
+  video.srcObject = stream
+  video.style.display = 'block'
+  await video.play()
+
+  if (typeof window.BarcodeDetector === 'function') {
+    const detector = new window.BarcodeDetector({ formats: ['qr_code'] })
+    state.scanTimer = setInterval(async () => {
+      try {
+        const codes = await detector.detect(video)
+        if (codes && codes.length > 0 && codes[0].rawValue) {
+          const val = codes[0].rawValue
+          stopQrCameraScan()
+          const inviteBox = document.getElementById('invite-box')
+          if (inviteBox) inviteBox.value = val
+          await acceptZeroServerToken(val)
+        }
+      } catch {}
+    }, 250)
+  } else {
+    state.status = 'camera-open-paste-token-if-no-barcode-api'
+    updateStatsUI()
+  }
+}
+
+function stopQrCameraScan () {
+  clearInterval(state.scanTimer)
+  state.scanTimer = null
+  if (state.scanStream) {
+    for (const track of state.scanStream.getTracks()) track.stop()
+    state.scanStream = null
+  }
+  const video = document.getElementById('qr-video')
+  if (video) {
+    video.srcObject = null
+    video.style.display = 'none'
   }
 }
 
@@ -375,6 +452,7 @@ window.startPearChat = startPearChat
 window.sendChatMessage = sendChatMessage
 window.createZeroServerInvite = createZeroServerInvite
 window.acceptZeroServerToken = acceptZeroServerToken
+window.startQrCameraScan = startQrCameraScan
 
 window.addEventListener('DOMContentLoaded', () => {
   const nickInput = document.getElementById('nick-input')
@@ -386,6 +464,8 @@ window.addEventListener('DOMContentLoaded', () => {
   const createInviteBtn = document.getElementById('create-invite-btn')
   const copyInviteBtn = document.getElementById('copy-invite-btn')
   const acceptInviteBtn = document.getElementById('accept-invite-btn')
+  const scanQrBtn = document.getElementById('scan-qr-btn')
+  const closeQrBtn = document.getElementById('close-qr-btn')
   const inviteBox = document.getElementById('invite-box')
 
   if (nickInput) nickInput.value = state.nick
@@ -432,6 +512,19 @@ window.addEventListener('DOMContentLoaded', () => {
     })
   }
 
+  if (scanQrBtn) {
+    scanQrBtn.addEventListener('click', () => {
+      startQrCameraScan().catch((err) => {
+        state.status = `camera error: ${err.message}`
+        updateStatsUI()
+      })
+    })
+  }
+
+  if (closeQrBtn) {
+    closeQrBtn.addEventListener('click', () => hideQrModal())
+  }
+
   if (sendBtn && msgInput) {
     const doSend = () => {
       const val = msgInput.value
@@ -448,7 +541,14 @@ window.addEventListener('DOMContentLoaded', () => {
 
   setInterval(updateStatsUI, 250)
 
-  if (params.get('autostart') === '1') {
+  // If opened by scanning an Invite QR code (?i=<offer>), auto-accept and display the Answer QR immediately!
+  if (initialInviteParam) {
+    if (inviteBox) inviteBox.value = initialInviteParam
+    acceptZeroServerToken(initialInviteParam).catch((err) => {
+      state.status = `error: ${err.message}`
+      updateStatsUI()
+    })
+  } else if (params.get('autostart') === '1') {
     startPearChat().catch((err) => {
       state.status = `error: ${err.message}`
       updateStatsUI()
